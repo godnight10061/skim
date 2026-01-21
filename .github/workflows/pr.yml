@@ -20,6 +20,7 @@ jobs:
           pass_on_octokit_error: false
           configuration_path: .github/pr-title-checker-config.json
   generate-files:
+    if: github.repository == 'skim-rs/skim'
     runs-on: ubuntu-22.04
     permissions:
       contents: write
