@@ -27,6 +27,108 @@ use thiserror::Error;
 use skim::prelude::*;
 use skim::tui::Event;
 
+#[cfg(windows)]
+mod windows_tty {
+    use std::ffi::OsStr;
+    use std::fs::File;
+    use std::io;
+    use std::os::windows::ffi::OsStrExt as _;
+    use std::os::windows::io::{FromRawHandle as _, OwnedHandle, RawHandle};
+
+    type Handle = isize;
+
+    const INVALID_HANDLE_VALUE: Handle = -1;
+
+    const STD_INPUT_HANDLE: i32 = -10;
+
+    const DUPLICATE_SAME_ACCESS: u32 = 0x0000_0002;
+    const GENERIC_READ: u32 = 0x8000_0000;
+    const GENERIC_WRITE: u32 = 0x4000_0000;
+    const FILE_SHARE_READ: u32 = 0x0000_0001;
+    const FILE_SHARE_WRITE: u32 = 0x0000_0002;
+    const OPEN_EXISTING: u32 = 3;
+
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn CloseHandle(h_object: Handle) -> i32;
+        fn CreateFileW(
+            lp_file_name: *const u16,
+            dw_desired_access: u32,
+            dw_share_mode: u32,
+            lp_security_attributes: *mut core::ffi::c_void,
+            dw_creation_disposition: u32,
+            dw_flags_and_attributes: u32,
+            h_template_file: Handle,
+        ) -> Handle;
+        fn DuplicateHandle(
+            h_source_process_handle: Handle,
+            h_source_handle: Handle,
+            h_target_process_handle: Handle,
+            lp_target_handle: *mut Handle,
+            dw_desired_access: u32,
+            b_inherit_handle: i32,
+            dw_options: u32,
+        ) -> i32;
+        fn GetCurrentProcess() -> Handle;
+        fn GetLastError() -> u32;
+        fn GetStdHandle(n_std_handle: i32) -> Handle;
+        fn SetStdHandle(n_std_handle: i32, handle: Handle) -> i32;
+    }
+
+    fn last_os_error() -> io::Error {
+        io::Error::from_raw_os_error(unsafe { GetLastError() } as i32)
+    }
+
+    fn to_wide(s: &OsStr) -> Vec<u16> {
+        s.encode_wide().chain(Some(0)).collect()
+    }
+
+    pub(super) fn duplicate_stdin_to_file() -> io::Result<File> {
+        let stdin_handle = unsafe { GetStdHandle(STD_INPUT_HANDLE) };
+        if stdin_handle == 0 || stdin_handle == INVALID_HANDLE_VALUE {
+            return Err(io::Error::other("stdin handle is invalid"));
+        }
+
+        let proc = unsafe { GetCurrentProcess() };
+        let mut dup: Handle = 0;
+        let ok = unsafe { DuplicateHandle(proc, stdin_handle, proc, &mut dup, 0, 0, DUPLICATE_SAME_ACCESS) };
+        if ok == 0 {
+            return Err(last_os_error());
+        }
+
+        let raw: RawHandle = dup as RawHandle;
+        Ok(unsafe { File::from_raw_handle(raw) })
+    }
+
+    pub(super) fn switch_stdin_to_conin() -> io::Result<OwnedHandle> {
+        let conin = to_wide(OsStr::new("CONIN$"));
+        let handle = unsafe {
+            CreateFileW(
+                conin.as_ptr(),
+                GENERIC_READ | GENERIC_WRITE,
+                FILE_SHARE_READ | FILE_SHARE_WRITE,
+                core::ptr::null_mut(),
+                OPEN_EXISTING,
+                0,
+                0,
+            )
+        };
+        if handle == 0 || handle == INVALID_HANDLE_VALUE {
+            return Err(last_os_error());
+        }
+
+        let ok = unsafe { SetStdHandle(STD_INPUT_HANDLE, handle) };
+        if ok == 0 {
+            unsafe {
+                CloseHandle(handle);
+            }
+            return Err(last_os_error());
+        }
+
+        Ok(unsafe { OwnedHandle::from_raw_handle(handle as RawHandle) })
+    }
+}
+
 #[cfg(unix)]
 fn run_tmux(opts: &SkimOptions) -> Option<SkimOutput> {
     skim::tmux::run_with(opts)
@@ -194,9 +296,15 @@ fn sk_main(mut opts: SkimOptions) -> Result<i32> {
         run_tmux(&opts)
     } else {
         // read from pipe or command
-        let rx_item = if io::stdin().is_terminal() || (opts.interactive && opts.cmd.is_some()) {
+        let stdin_is_terminal = io::stdin().is_terminal();
+        let rx_item = if stdin_is_terminal || (opts.interactive && opts.cmd.is_some()) {
             None
         } else {
+            #[cfg(windows)]
+            let rx_item = cmd_collector
+                .borrow()
+                .of_bufread(BufReader::new(windows_tty::duplicate_stdin_to_file()?));
+            #[cfg(not(windows))]
             let rx_item = cmd_collector.borrow().of_bufread(BufReader::new(std::io::stdin()));
             Some(rx_item)
         };
@@ -204,6 +312,14 @@ fn sk_main(mut opts: SkimOptions) -> Result<i32> {
         if opts.filter.is_some() {
             return Ok(filter(&bin_options, &opts, rx_item));
         }
+
+        #[cfg(windows)]
+        let _stdin_guard = if !stdin_is_terminal {
+            Some(windows_tty::switch_stdin_to_conin()?)
+        } else {
+            None
+        };
+
         Some(Skim::run_with(opts, rx_item)?)
     }) else {
         return Ok(135);
