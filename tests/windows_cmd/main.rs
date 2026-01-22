@@ -475,6 +475,7 @@ fn interactive_cmd_piped_stdin_accepts_typed_query() -> io::Result<()> {
     }
 
     let bytes = std::fs::read(&out_path)?;
+    let _ = std::fs::remove_file(&out_path);
     let parts = bytes.split(|b| *b == 0).filter(|s| !s.is_empty()).collect::<Vec<_>>();
 
     fn trim_end_ascii_space(mut s: &[u8]) -> &[u8] {
